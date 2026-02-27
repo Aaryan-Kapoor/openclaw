@@ -5,6 +5,7 @@ import { generateSecureToken } from "../../infra/secure-random.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type { PluginHookBeforeAgentStartResult } from "../../plugins/types.js";
 import { enqueueCommandInLane } from "../../process/command-queue.js";
+import { runLlm } from "../../shared/llm-router.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveOpenClawAgentDir } from "../agent-paths.js";
 import { hasConfiguredModelFallbacks } from "../agent-scope.js";
@@ -303,6 +304,35 @@ export async function runEmbeddedPiAgent(
           provider,
           model: modelId,
         });
+      }
+
+      // Anthropic Agent SDK wrapper path (toolless, single-turn) per spec.
+      const useAnthropicSdkWrapper = normalizeProviderId(provider) === "anthropic";
+      if (useAnthropicSdkWrapper) {
+        const sdkResult = await runLlm(params.prompt, {
+          model: modelId,
+          timeoutMs: params.timeoutMs,
+          caller: params.sessionKey || params.sessionId || "embedded-agent",
+        });
+
+        return {
+          payloads: sdkResult.text ? [{ text: sdkResult.text }] : [],
+          meta: {
+            durationMs: sdkResult.durationMs,
+            agentMeta: {
+              sessionId: params.sessionId,
+              provider: "anthropic",
+              model: modelId,
+              promptTokens: Math.ceil(String(params.prompt ?? "").length / 4) || undefined,
+            },
+            stopReason: "completed",
+          },
+          didSendViaMessagingTool: false,
+          messagingToolSentTexts: [],
+          messagingToolSentMediaUrls: [],
+          messagingToolSentTargets: [],
+          successfulCronAdds: 0,
+        };
       }
 
       const ctxInfo = resolveContextWindowInfo({
