@@ -842,6 +842,62 @@ export function buildKilocodeProvider(): ProviderConfig {
   };
 }
 
+// ── Anthropic Agent SDK provider ─────────────────────────────────────────────
+// Completely independent from the built-in "anthropic" (anthropic-messages)
+// provider. Routes through @anthropic-ai/claude-agent-sdk's query() which
+// spawns a Claude Code subprocess. Enabled when CLAUDE_CODE_OAUTH_TOKEN is set.
+
+const ANTHROPIC_AGENT_SDK_DEFAULT_CONTEXT_WINDOW = 200000;
+const ANTHROPIC_AGENT_SDK_DEFAULT_MAX_TOKENS = 16384;
+const ANTHROPIC_AGENT_SDK_PLACEHOLDER_API_KEY = "claude-oauth";
+
+function buildAnthropicAgentSDKProvider(): ProviderConfig {
+  return {
+    // No HTTP base URL — the SDK spawns a Claude Code subprocess.
+    // Placeholder satisfies the required field without being used.
+    baseUrl: "sdk://claude-agent",
+    api: "anthropic-agent-sdk",
+    models: [
+      {
+        id: "claude-opus-4-6",
+        name: "Claude Opus 4.6 (Agent SDK)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+        contextWindow: ANTHROPIC_AGENT_SDK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: ANTHROPIC_AGENT_SDK_DEFAULT_MAX_TOKENS,
+      },
+      {
+        id: "claude-sonnet-4-6",
+        name: "Claude Sonnet 4.6 (Agent SDK)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+        contextWindow: ANTHROPIC_AGENT_SDK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: ANTHROPIC_AGENT_SDK_DEFAULT_MAX_TOKENS,
+      },
+      {
+        id: "claude-opus-4",
+        name: "Claude Opus 4 (Agent SDK)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+        contextWindow: ANTHROPIC_AGENT_SDK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: ANTHROPIC_AGENT_SDK_DEFAULT_MAX_TOKENS,
+      },
+      {
+        id: "claude-sonnet-4",
+        name: "Claude Sonnet 4 (Agent SDK)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+        contextWindow: ANTHROPIC_AGENT_SDK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: ANTHROPIC_AGENT_SDK_DEFAULT_MAX_TOKENS,
+      },
+    ],
+  };
+}
+
 export async function resolveImplicitProviders(params: {
   agentDir: string;
   explicitProviders?: Record<string, ProviderConfig> | null;
@@ -1034,6 +1090,16 @@ export async function resolveImplicitProviders(params: {
     resolveApiKeyFromProfiles({ provider: "kilocode", store: authStore });
   if (kilocodeKey) {
     providers.kilocode = { ...buildKilocodeProvider(), apiKey: kilocodeKey };
+  }
+
+  // Anthropic Agent SDK provider — independent from the built-in "anthropic" provider.
+  // Enabled when CLAUDE_CODE_OAUTH_TOKEN is available (set after `claude login`).
+  const hasOAuthToken = Boolean(process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim());
+  if (hasOAuthToken) {
+    providers["anthropic-agent-sdk"] = {
+      ...buildAnthropicAgentSDKProvider(),
+      apiKey: ANTHROPIC_AGENT_SDK_PLACEHOLDER_API_KEY,
+    };
   }
 
   return providers;

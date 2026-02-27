@@ -6,7 +6,9 @@ const MAX_TEXT_LEN = 10_000;
 
 export const MODEL_PRICING_PER_1M = {
   "claude-opus-4": { input: 15, output: 75 },
+  "claude-opus-4-6": { input: 15, output: 75 },
   "claude-sonnet-4": { input: 3, output: 15 },
+  "claude-sonnet-4-6": { input: 3, output: 15 },
   "claude-3-5-sonnet-latest": { input: 3, output: 15 },
   "claude-3-5-haiku-latest": { input: 0.8, output: 4 },
   "gpt-4.1": { input: 5, output: 15 },
@@ -91,8 +93,14 @@ function selectPriceModel(model = "") {
   if (MODEL_PRICING_PER_1M[lower]) {
     return lower;
   }
+  if (lower.includes("opus-4-6") || lower.includes("opus-4.6")) {
+    return "claude-opus-4-6";
+  }
   if (lower.includes("opus-4")) {
     return "claude-opus-4";
+  }
+  if (lower.includes("sonnet-4-6") || lower.includes("sonnet-4.6")) {
+    return "claude-sonnet-4-6";
   }
   if (lower.includes("sonnet-4")) {
     return "claude-sonnet-4";

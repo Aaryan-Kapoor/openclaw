@@ -1,6 +1,10 @@
 export const MODEL_ALIASES = {
   "opus-4": "claude-opus-4",
+  "opus-4.6": "claude-opus-4-6",
+  "opus-4-6": "claude-opus-4-6",
   "sonnet-4": "claude-sonnet-4",
+  "sonnet-4.6": "claude-sonnet-4-6",
+  "sonnet-4-6": "claude-sonnet-4-6",
   haiku: "claude-3-5-haiku-latest",
   "haiku-3.5": "claude-3-5-haiku-latest",
 };
