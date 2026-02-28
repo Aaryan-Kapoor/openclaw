@@ -7,6 +7,7 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { z } from "zod";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { splitMediaFromOutput } from "../media/parse.js";
 
 const log = createSubsystemLogger("agent-sdk-mcp-bridge");
 
@@ -92,6 +93,8 @@ type McpCallToolResult = {
   isError?: boolean;
 };
 
+type OnToolResultFn = (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+
 /**
  * Create an in-process MCP server exposing OpenClaw tools to the Agent SDK.
  *
@@ -102,6 +105,7 @@ export function createOpenClawMcpServer(
   tools: AgentTool[],
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK is dynamically imported
   sdk: Record<string, any>,
+  onToolResult?: OnToolResultFn,
 ): unknown {
   const createSdkMcpServer = sdk.createSdkMcpServer as (options: {
     name: string;
@@ -122,6 +126,18 @@ export function createOpenClawMcpServer(
       const toolCallId = `mcp-${toolName}-${Date.now()}`;
       try {
         const result = await agentTool.execute(toolCallId, args);
+        // Deliver media side effects (e.g. TTS audio) directly via callback
+        // since Agent SDK tool results don't flow through the normal event pipeline.
+        if (onToolResult) {
+          for (const part of result?.content ?? []) {
+            if (part.type === "text" && part.text) {
+              const parsed = splitMediaFromOutput(part.text);
+              if (parsed.mediaUrls?.length) {
+                void onToolResult({ mediaUrls: parsed.mediaUrls });
+              }
+            }
+          }
+        }
         const content = (result?.content ?? []).map(
           (part: { type: string; text?: string; data?: string; mimeType?: string }) => {
             if (part.type === "text") {

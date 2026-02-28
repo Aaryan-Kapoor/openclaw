@@ -770,7 +770,9 @@ export async function runEmbeddedAttempt(
         const ollamaBaseUrl = modelBaseUrl || providerBaseUrl || OLLAMA_NATIVE_BASE_URL;
         activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
       } else if (params.model.api === "anthropic-agent-sdk") {
-        activeSession.agent.streamFn = createAnthropicAgentSDKStreamFn();
+        activeSession.agent.streamFn = createAnthropicAgentSDKStreamFn({
+          onToolResult: params.onToolResult,
+        });
       } else {
         // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
         activeSession.agent.streamFn = streamSimple;

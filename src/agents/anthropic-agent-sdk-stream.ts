@@ -98,7 +98,9 @@ function buildAssistantMessageFromSDK(
 
 // ── Main StreamFn factory ───────────────────────────────────────────────────
 
-export function createAnthropicAgentSDKStreamFn(): StreamFn {
+export function createAnthropicAgentSDKStreamFn(opts?: {
+  onToolResult?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+}): StreamFn {
   return (model, context, _options) => {
     const stream = createAssistantMessageEventStream();
 
@@ -122,7 +124,7 @@ export function createAnthropicAgentSDKStreamFn(): StreamFn {
         const mcpServers: Record<string, unknown> = {};
         const contextTools = (context as { tools?: AgentTool[] }).tools;
         if (Array.isArray(contextTools) && contextTools.length > 0) {
-          mcpServers["openclaw"] = createOpenClawMcpServer(contextTools, sdk);
+          mcpServers["openclaw"] = createOpenClawMcpServer(contextTools, sdk, opts?.onToolResult);
           log.info(`Agent SDK: ${contextTools.length} openclaw tools registered via MCP`);
         }
 
