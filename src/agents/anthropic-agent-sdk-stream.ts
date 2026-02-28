@@ -1,6 +1,7 @@
 import type { AgentTool, StreamFn } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, StopReason, Usage } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import { isSilentReplyText } from "../auto-reply/tokens.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createOpenClawMcpServer } from "./anthropic-agent-sdk-mcp-bridge.js";
 
@@ -193,7 +194,8 @@ export function createAnthropicAgentSDKStreamFn(): StreamFn {
         }
 
         // 6. Build AssistantMessage and push done event
-        const message = buildAssistantMessageFromSDK(resultText.trim(), {
+        const finalText = isSilentReplyText(resultText.trim()) ? "" : resultText.trim();
+        const message = buildAssistantMessageFromSDK(finalText, {
           api: model.api,
           provider: model.provider,
           id: model.id,
