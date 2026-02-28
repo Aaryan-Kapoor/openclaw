@@ -1,7 +1,8 @@
-import type { StreamFn } from "@mariozechner/pi-agent-core";
+import type { AgentTool, StreamFn } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, StopReason, Usage } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { createOpenClawMcpServer } from "./anthropic-agent-sdk-mcp-bridge.js";
 
 const log = createSubsystemLogger("anthropic-agent-sdk-stream");
 
@@ -37,9 +38,8 @@ function extractTextContent(content: unknown): string {
  * subprocess can see the conversation thread.
  */
 function formatConversationForSDK(messages: Array<{ role: string; content: unknown }>): string {
-  // Find the last user message — this is the primary prompt.
-  let lastUserText = "";
   const historyParts: string[] = [];
+  let lastUserText = "";
 
   for (const msg of messages) {
     const text = extractTextContent(msg.content).trim();
@@ -48,17 +48,19 @@ function formatConversationForSDK(messages: Array<{ role: string; content: unkno
     }
 
     if (msg.role === "user") {
+      // Push previous user message to history before overwriting
+      if (lastUserText) {
+        historyParts.push(`[User]: ${lastUserText}`);
+      }
       lastUserText = text;
     } else if (msg.role === "assistant") {
-      // Accumulate history context
       historyParts.push(`[Assistant]: ${text}`);
     }
   }
 
-  // If there's meaningful history, prepend it for context
+  // Prepend recent history for context
   if (historyParts.length > 0 && lastUserText) {
-    // Keep only the most recent history to stay within reasonable prompt size
-    const recentHistory = historyParts.slice(-5).join("\n\n");
+    const recentHistory = historyParts.slice(-10).join("\n\n");
     return `<conversation_context>\n${recentHistory}\n</conversation_context>\n\n${lastUserText}`;
   }
 
@@ -115,7 +117,15 @@ export function createAnthropicAgentSDKStreamFn(): StreamFn {
           (context.messages ?? []) as Array<{ role: string; content: unknown }>,
         );
 
-        // 3. Call Agent SDK with system prompt + tools
+        // 3. Build MCP server from OpenClaw tools (if available)
+        const mcpServers: Record<string, unknown> = {};
+        const contextTools = (context as { tools?: AgentTool[] }).tools;
+        if (Array.isArray(contextTools) && contextTools.length > 0) {
+          mcpServers["openclaw"] = createOpenClawMcpServer(contextTools, sdk);
+          log.info(`Agent SDK: ${contextTools.length} openclaw tools registered via MCP`);
+        }
+
+        // 4. Call Agent SDK with system prompt + MCP tools
         log.info(
           `Agent SDK call: model=${model.id} prompt_len=${prompt.length} system_len=${(context.systemPrompt ?? "").length}`,
         );
@@ -125,18 +135,26 @@ export function createAnthropicAgentSDKStreamFn(): StreamFn {
           options: {
             model: model.id,
             systemPrompt: context.systemPrompt || undefined,
-            tools: { type: "preset", preset: "claude_code" },
+            tools: [] as const,
+            mcpServers: mcpServers as Record<string, never>,
             maxTurns: 10,
-            permissionMode: "acceptEdits",
+            permissionMode: "bypassPermissions",
+            allowDangerouslySkipPermissions: true,
           },
         });
 
-        // 4. Iterate stream, collect result
+        // 5. Iterate stream, collect result
         let resultText = "";
         for await (const evt of sdkStream) {
           // SDKResultSuccess event contains the final response text
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
+          }
+          if (evt.type === "result" && evt.subtype === "error") {
+            const errEvt = evt as { error?: string; exit_reason?: string; exit_code?: number };
+            log.error(
+              `Agent SDK result error: reason=${errEvt.exit_reason} code=${errEvt.exit_code} error=${errEvt.error}`,
+            );
           }
           // Also capture streaming text chunks
           const chunks = [
@@ -174,7 +192,7 @@ export function createAnthropicAgentSDKStreamFn(): StreamFn {
           }
         }
 
-        // 5. Build AssistantMessage and push done event
+        // 6. Build AssistantMessage and push done event
         const message = buildAssistantMessageFromSDK(resultText.trim(), {
           api: model.api,
           provider: model.provider,
