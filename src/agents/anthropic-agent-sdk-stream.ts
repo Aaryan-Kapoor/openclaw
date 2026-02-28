@@ -182,42 +182,20 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
               `Agent SDK result error: reason=${errEvt.exit_reason} code=${errEvt.exit_code} error=${errEvt.error}`,
             );
           }
-          // Capture and forward streaming text chunks
-          const chunks = [
-            (evt as { text?: string }).text,
-            (evt as { delta?: { text?: string } }).delta?.text,
-            (evt as { message?: { text?: string } }).message?.text,
-            (evt as { content_block?: { text?: string } }).content_block?.text,
-          ].filter(Boolean) as string[];
-          if (chunks.length && !gotFinalResult) {
-            for (const chunk of chunks) {
-              emitDelta(chunk);
-            }
-            resultText += chunks.join("");
-          }
-          // Check content blocks
-          const blocks = [
-            ...(Array.isArray((evt as { content?: unknown[] }).content)
-              ? ((evt as { content: unknown[] }).content as Array<{ type?: string; text?: string }>)
-              : []),
-            ...(Array.isArray((evt as { message?: { content?: unknown[] } }).message?.content)
-              ? ((evt as { message: { content: unknown[] } }).message.content as Array<{
-                  type?: string;
-                  text?: string;
-                }>)
-              : []),
-            ...((evt as { content_block?: { type?: string; text?: string } }).content_block
-              ? [(evt as { content_block: { type?: string; text?: string } }).content_block]
-              : []),
-          ];
-          for (const block of blocks) {
+
+          // SDKPartialAssistantMessage: { type: 'stream_event', event: BetaRawMessageStreamEvent }
+          // Extract text deltas from content_block_delta events.
+          if (evt.type === "stream_event" && !gotFinalResult) {
+            const streamEvt = (evt as { event?: Record<string, unknown> }).event;
             if (
-              (block.type === "text" || block.type === "output_text") &&
-              block.text &&
-              !gotFinalResult
+              streamEvt?.type === "content_block_delta" &&
+              (streamEvt.delta as Record<string, unknown> | undefined)?.type === "text_delta"
             ) {
-              emitDelta(block.text);
-              resultText += block.text;
+              const delta = (streamEvt.delta as { text?: string }).text;
+              if (typeof delta === "string") {
+                emitDelta(delta);
+                resultText += delta;
+              }
             }
           }
         }
