@@ -146,12 +146,35 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           },
         });
 
-        // 5. Iterate stream, collect result
+        // 5. Iterate stream, emit text_delta events for live streaming
+        const modelInfo = { api: model.api, provider: model.provider, id: model.id };
         let resultText = "";
+        let textBlockStarted = false;
+        let gotFinalResult = false;
+
+        // Partial message built up as deltas arrive
+        const partial = buildAssistantMessageFromSDK("", modelInfo);
+        stream.push({ type: "start", partial });
+
+        const emitDelta = (delta: string) => {
+          if (!delta) {
+            return;
+          }
+          if (!textBlockStarted) {
+            textBlockStarted = true;
+            partial.content = [{ type: "text", text: "" }];
+            stream.push({ type: "text_start", contentIndex: 0, partial });
+          }
+          const textBlock = partial.content[0] as { type: "text"; text: string };
+          textBlock.text += delta;
+          stream.push({ type: "text_delta", contentIndex: 0, delta, partial });
+        };
+
         for await (const evt of sdkStream) {
           // SDKResultSuccess event contains the final response text
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
+            gotFinalResult = true;
           }
           if (evt.type === "result" && evt.subtype === "error") {
             const errEvt = evt as { error?: string; exit_reason?: string; exit_code?: number };
@@ -159,14 +182,17 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
               `Agent SDK result error: reason=${errEvt.exit_reason} code=${errEvt.exit_code} error=${errEvt.error}`,
             );
           }
-          // Also capture streaming text chunks
+          // Capture and forward streaming text chunks
           const chunks = [
             (evt as { text?: string }).text,
             (evt as { delta?: { text?: string } }).delta?.text,
             (evt as { message?: { text?: string } }).message?.text,
             (evt as { content_block?: { text?: string } }).content_block?.text,
-          ].filter(Boolean);
-          if (chunks.length && !resultText) {
+          ].filter(Boolean) as string[];
+          if (chunks.length && !gotFinalResult) {
+            for (const chunk of chunks) {
+              emitDelta(chunk);
+            }
             resultText += chunks.join("");
           }
           // Check content blocks
@@ -188,20 +214,26 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             if (
               (block.type === "text" || block.type === "output_text") &&
               block.text &&
-              !resultText
+              !gotFinalResult
             ) {
+              emitDelta(block.text);
               resultText += block.text;
             }
           }
         }
 
-        // 6. Build AssistantMessage and push done event
+        // 6. Close text block and push done event
         const finalText = isSilentReplyText(resultText.trim()) ? "" : resultText.trim();
-        const message = buildAssistantMessageFromSDK(finalText, {
-          api: model.api,
-          provider: model.provider,
-          id: model.id,
-        });
+        const message = buildAssistantMessageFromSDK(finalText, modelInfo);
+
+        if (textBlockStarted) {
+          stream.push({
+            type: "text_end",
+            contentIndex: 0,
+            content: finalText,
+            partial: message,
+          });
+        }
 
         log.info(`Agent SDK result: model=${model.id} text_len=${resultText.length}`);
 
