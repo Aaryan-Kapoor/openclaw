@@ -172,12 +172,6 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         };
 
         for await (const evt of sdkStream) {
-          // Debug: log every event type to understand SDK stream shape
-          const evtRecord = evt as Record<string, unknown>;
-          log.debug(
-            `Agent SDK evt: type=${String(evtRecord.type)} keys=${Object.keys(evtRecord).join(",")}`,
-          );
-
           // SDKResultSuccess event contains the final response text
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
