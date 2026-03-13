@@ -106,7 +106,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
 
     const run = async () => {
       // Track the SDK query so we can clean up the subprocess on abort
-      let sdkStream: AsyncGenerator<unknown, void> & { close?: () => void };
+      type SDKEvent = { type: string; subtype?: string; [k: string]: unknown };
+      let sdkStream: AsyncGenerator<SDKEvent, void> & { close?: () => void };
 
       try {
         // 1. Load the Agent SDK dynamically
