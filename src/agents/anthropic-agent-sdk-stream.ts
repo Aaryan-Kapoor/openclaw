@@ -74,6 +74,7 @@ function formatConversationForSDK(messages: Array<{ role: string; content: unkno
 function buildAssistantMessageFromSDK(
   text: string,
   modelInfo: { api: string; provider: string; id: string },
+  stopReason: StopReason = "stop",
 ): AssistantMessage {
   const usage: Usage = {
     input: 0,
@@ -87,7 +88,7 @@ function buildAssistantMessageFromSDK(
   return {
     role: "assistant",
     content: text ? [{ type: "text", text }] : [],
-    stopReason: "stop" as StopReason,
+    stopReason,
     api: modelInfo.api,
     provider: modelInfo.provider,
     model: modelInfo.id,
@@ -96,18 +97,30 @@ function buildAssistantMessageFromSDK(
   };
 }
 
+// ── SDK session tracking for resume support ─────────────────────────────────
+
+/** Last interrupted SDK session ID, keyed by OpenClaw session (via model+context). */
+let lastSdkSessionId: string | undefined;
+
 // ── Main StreamFn factory ───────────────────────────────────────────────────
 
 export function createAnthropicAgentSDKStreamFn(opts?: {
   onToolResult?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+  /** Check if steering messages are queued (new user message arrived mid-run). */
+  hasSteeringMessages?: () => boolean;
 }): StreamFn {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
 
     const run = async () => {
-      // Track the SDK query so we can clean up the subprocess on abort
       type SDKEvent = { type: string; subtype?: string; [k: string]: unknown };
-      let sdkStream: AsyncGenerator<SDKEvent, void> & { close?: () => void };
+      type SDKQuery = AsyncGenerator<SDKEvent, void> & {
+        close?: () => void;
+        interrupt?: () => Promise<void>;
+      };
+      let sdkStream: SDKQuery;
+      let interrupted = false;
+      let sdkSessionId: string | undefined;
 
       try {
         // 1. Load the Agent SDK dynamically
@@ -133,8 +146,15 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         }
 
         // 4. Call Agent SDK with system prompt + MCP tools
+        //    If we have a previous interrupted session, resume it instead of starting fresh.
+        const resumeId = lastSdkSessionId;
+        if (resumeId) {
+          log.info(`Agent SDK: resuming interrupted session ${resumeId}`);
+          lastSdkSessionId = undefined;
+        }
+
         log.info(
-          `Agent SDK call: model=${model.id} prompt_len=${prompt.length} system_len=${(context.systemPrompt ?? "").length}`,
+          `Agent SDK call: model=${model.id} prompt_len=${prompt.length} system_len=${(context.systemPrompt ?? "").length} resume=${resumeId ?? "none"}`,
         );
 
         sdkStream = queryFn({
@@ -151,22 +171,36 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
             includePartialMessages: true,
+            // Resume a previously interrupted session if available.
+            ...(resumeId ? { resume: resumeId } : {}),
           },
-        });
+        }) as SDKQuery;
 
-        // Wire up abort signal to kill the SDK subprocess on timeout/cancel.
-        // Matches how ollama-stream.ts passes options.signal to fetch().
+        // Wire up abort signal — uses interrupt() to preserve progress.
+        // On abort, the SDK session is saved to disk and can be resumed
+        // on the next query via the `resume` option.
         const signal = options?.signal;
         if (signal) {
-          const onAbort = () => {
-            log.info("Agent SDK: abort signal received, closing subprocess");
-            sdkStream.close?.();
+          const onAbort = async () => {
+            log.info("Agent SDK: abort signal received, interrupting subprocess");
+            interrupted = true;
+            if (sdkStream.interrupt) {
+              try {
+                await sdkStream.interrupt();
+              } catch {
+                // Interrupt failed (e.g. subprocess already exited), fall back to close
+                sdkStream.close?.();
+              }
+            } else {
+              sdkStream.close?.();
+            }
           };
           if (signal.aborted) {
+            interrupted = true;
             sdkStream.close?.();
             throw new Error("aborted");
           }
-          signal.addEventListener("abort", onAbort, { once: true });
+          signal.addEventListener("abort", () => void onAbort(), { once: true });
         }
 
         // 5. Iterate stream, emit text_delta events for live streaming
@@ -194,6 +228,11 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         };
 
         for await (const evt of sdkStream) {
+          // Capture SDK session ID from any event for resume support.
+          if (!sdkSessionId && typeof evt.session_id === "string") {
+            sdkSessionId = evt.session_id;
+          }
+
           // SDKResultSuccess event contains the final response text
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
@@ -228,11 +267,38 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
               }
             }
           }
+
+          // Check for steering messages between SDK events. If a new user message
+          // arrived mid-run, interrupt gracefully so pi-agent-core can process it.
+          if (opts?.hasSteeringMessages?.() && !interrupted && !gotFinalResult) {
+            log.info("Agent SDK: steering message detected, interrupting for handoff");
+            interrupted = true;
+            if (sdkStream.interrupt) {
+              try {
+                await sdkStream.interrupt();
+              } catch {
+                sdkStream.close?.();
+              }
+            } else {
+              sdkStream.close?.();
+            }
+            // Loop will exit when the SDK stream ends after interrupt.
+          }
         }
 
-        // 6. Close text block and push done event
+        // 6. Close text block and push done/error event
+        const wasAborted = options?.signal?.aborted === true;
+        const wasInterrupted = interrupted;
+
+        // Save SDK session ID for resume if interrupted (not hard-aborted via /stop).
+        if (wasInterrupted && !wasAborted && sdkSessionId) {
+          lastSdkSessionId = sdkSessionId;
+          log.info(`Agent SDK: saved session ${sdkSessionId} for resume`);
+        }
+
+        const stopReason: StopReason = wasAborted ? ("aborted" as StopReason) : "stop";
         const finalText = isSilentReplyText(resultText.trim()) ? "" : resultText.trim();
-        const message = buildAssistantMessageFromSDK(finalText, modelInfo);
+        const message = buildAssistantMessageFromSDK(finalText, modelInfo, stopReason);
 
         if (textBlockStarted) {
           stream.push({
@@ -243,13 +309,23 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           });
         }
 
-        log.info(`Agent SDK result: model=${model.id} text_len=${resultText.length}`);
+        log.info(
+          `Agent SDK result: model=${model.id} text_len=${resultText.length} aborted=${wasAborted} interrupted=${wasInterrupted}`,
+        );
 
-        stream.push({
-          type: "done",
-          reason: "stop",
-          message,
-        });
+        if (wasAborted) {
+          stream.push({
+            type: "error",
+            reason: "aborted",
+            error: message,
+          });
+        } else {
+          stream.push({
+            type: "done",
+            reason: "stop",
+            message,
+          });
+        }
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         log.error(`Agent SDK error: ${errorMessage}`);

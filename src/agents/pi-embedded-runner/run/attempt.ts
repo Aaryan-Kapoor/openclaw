@@ -772,6 +772,7 @@ export async function runEmbeddedAttempt(
       } else if (params.model.api === "anthropic-agent-sdk") {
         activeSession.agent.streamFn = createAnthropicAgentSDKStreamFn({
           onToolResult: params.onToolResult,
+          hasSteeringMessages: () => activeSession.agent.hasQueuedMessages(),
         });
       } else {
         // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
