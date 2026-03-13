@@ -114,10 +114,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
 
     const run = async () => {
       type SDKEvent = { type: string; subtype?: string; [k: string]: unknown };
-      type SDKQuery = AsyncGenerator<SDKEvent, void> & {
-        close?: () => void;
-        interrupt?: () => Promise<void>;
-      };
+      type SDKQuery = AsyncGenerator<SDKEvent, void> & { close?: () => void };
       let sdkStream: SDKQuery;
       let interrupted = false;
       let sdkSessionId: string | undefined;
@@ -176,31 +173,24 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           },
         }) as SDKQuery;
 
-        // Wire up abort signal — uses interrupt() to preserve progress.
-        // On abort, the SDK session is saved to disk and can be resumed
-        // on the next query via the `resume` option.
+        // Wire up abort signal — uses close() to immediately kill the subprocess.
+        // Session is preserved on disk (persistSession defaults to true), so
+        // the next query() can resume via the `resume` option.
+        // close() is used instead of interrupt() because interrupt() is cooperative
+        // (waits for subprocess to respond) and hangs when tools are executing.
         const signal = options?.signal;
         if (signal) {
-          const onAbort = async () => {
-            log.info("Agent SDK: abort signal received, interrupting subprocess");
+          const onAbort = () => {
+            log.info("Agent SDK: abort signal received, closing subprocess");
             interrupted = true;
-            if (sdkStream.interrupt) {
-              try {
-                await sdkStream.interrupt();
-              } catch {
-                // Interrupt failed (e.g. subprocess already exited), fall back to close
-                sdkStream.close?.();
-              }
-            } else {
-              sdkStream.close?.();
-            }
+            sdkStream.close?.();
           };
           if (signal.aborted) {
             interrupted = true;
             sdkStream.close?.();
             throw new Error("aborted");
           }
-          signal.addEventListener("abort", () => void onAbort(), { once: true });
+          signal.addEventListener("abort", onAbort, { once: true });
         }
 
         // 5. Iterate stream, emit text_delta events for live streaming
@@ -269,20 +259,12 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           }
 
           // Check for steering messages between SDK events. If a new user message
-          // arrived mid-run, interrupt gracefully so pi-agent-core can process it.
+          // arrived mid-run, close the subprocess so pi-agent-core can process
+          // the steering message. Session is saved to disk for resume.
           if (opts?.hasSteeringMessages?.() && !interrupted && !gotFinalResult) {
-            log.info("Agent SDK: steering message detected, interrupting for handoff");
+            log.info("Agent SDK: steering message detected, closing for handoff");
             interrupted = true;
-            if (sdkStream.interrupt) {
-              try {
-                await sdkStream.interrupt();
-              } catch {
-                sdkStream.close?.();
-              }
-            } else {
-              sdkStream.close?.();
-            }
-            // Loop will exit when the SDK stream ends after interrupt.
+            sdkStream.close?.();
           }
         }
 
@@ -290,8 +272,9 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         const wasAborted = options?.signal?.aborted === true;
         const wasInterrupted = interrupted;
 
-        // Save SDK session ID for resume if interrupted (not hard-aborted via /stop).
-        if (wasInterrupted && !wasAborted && sdkSessionId) {
+        // Save SDK session ID for resume. close() preserves session on disk
+        // (persistSession defaults to true), so both /stop and steering can resume.
+        if ((wasInterrupted || wasAborted) && sdkSessionId) {
           lastSdkSessionId = sdkSessionId;
           log.info(`Agent SDK: saved session ${sdkSessionId} for resume`);
         }
