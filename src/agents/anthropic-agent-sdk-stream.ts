@@ -101,10 +101,13 @@ function buildAssistantMessageFromSDK(
 export function createAnthropicAgentSDKStreamFn(opts?: {
   onToolResult?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
 }): StreamFn {
-  return (model, context, _options) => {
+  return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
 
     const run = async () => {
+      // Track the SDK query so we can clean up the subprocess on abort
+      let sdkStream: AsyncGenerator<unknown, void> & { close?: () => void };
+
       try {
         // 1. Load the Agent SDK dynamically
         const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -133,19 +136,37 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           `Agent SDK call: model=${model.id} prompt_len=${prompt.length} system_len=${(context.systemPrompt ?? "").length}`,
         );
 
-        const sdkStream = queryFn({
+        sdkStream = queryFn({
           prompt,
           options: {
             model: model.id,
             systemPrompt: context.systemPrompt || undefined,
+            // Disable all built-in Claude Code tools (Bash, Read, Edit, etc.) — only
+            // MCP-bridged OpenClaw tools are available via mcpServers below.
             tools: [] as const,
             mcpServers: mcpServers as Record<string, never>,
-            maxTurns: 10,
+            // maxTurns omitted — unlimited turns, matching pi-agent-core behavior
+            // for all other providers (OpenAI, Google, etc.).
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
             includePartialMessages: true,
           },
         });
+
+        // Wire up abort signal to kill the SDK subprocess on timeout/cancel.
+        // Matches how ollama-stream.ts passes options.signal to fetch().
+        const signal = options?.signal;
+        if (signal) {
+          const onAbort = () => {
+            log.info("Agent SDK: abort signal received, closing subprocess");
+            sdkStream.close?.();
+          };
+          if (signal.aborted) {
+            sdkStream.close?.();
+            throw new Error("aborted");
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
 
         // 5. Iterate stream, emit text_delta events for live streaming
         const modelInfo = { api: model.api, provider: model.provider, id: model.id };
@@ -177,11 +198,18 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             resultText = (evt as { result?: string }).result ?? "";
             gotFinalResult = true;
           }
-          if (evt.type === "result" && evt.subtype === "error") {
-            const errEvt = evt as { error?: string; exit_reason?: string; exit_code?: number };
-            log.error(
-              `Agent SDK result error: reason=${errEvt.exit_reason} code=${errEvt.exit_code} error=${errEvt.error}`,
-            );
+          if (evt.type === "result" && evt.subtype !== "success") {
+            // SDKResultError subtypes: error_during_execution | error_max_turns |
+            // error_max_budget_usd | error_max_structured_output_retries
+            const errEvt = evt as {
+              subtype?: string;
+              errors?: string[];
+              num_turns?: number;
+              stop_reason?: string | null;
+            };
+            const errMsg = `Agent SDK result error: subtype=${errEvt.subtype} turns=${errEvt.num_turns} stop_reason=${errEvt.stop_reason} errors=${(errEvt.errors ?? []).join("; ")}`;
+            log.error(errMsg);
+            throw new Error(errMsg);
           }
 
           // SDKPartialAssistantMessage: { type: 'stream_event', event: BetaRawMessageStreamEvent }
