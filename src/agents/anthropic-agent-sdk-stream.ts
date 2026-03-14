@@ -289,9 +289,9 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
             includePartialMessages: true,
-            // Enable 1M context window for Opus 4.6 and Sonnet 4.6.
-            betas: ["context-1m-2025-08-07"] as unknown as never[],
             // Map thinking level from /think command to SDK effort parameter.
+            // Note: 1M context is enabled via model ID suffix [1m] (e.g. claude-opus-4-6[1m]),
+            // handled by the Claude Code subprocess — no beta header needed.
             ...(effort ? { effort } : {}),
             // Resume a previously interrupted session if available.
             ...(resumeId ? { resume: resumeId } : {}),
