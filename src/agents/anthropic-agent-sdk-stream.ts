@@ -289,6 +289,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
             includePartialMessages: true,
+            // Enable 1M context window for Opus 4.6 and Sonnet 4.6.
+            betas: ["context-1m-2025-08-07"] as unknown as never[],
             // Map thinking level from /think command to SDK effort parameter.
             ...(effort ? { effort } : {}),
             // Resume a previously interrupted session if available.
