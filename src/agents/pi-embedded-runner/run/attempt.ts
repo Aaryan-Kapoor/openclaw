@@ -758,6 +758,9 @@ export async function runEmbeddedAttempt(
         workspaceDir: params.workspaceDir,
       });
 
+      // Mutable ref for SDK compaction callback — wired after subscription exists.
+      const sdkCompactionRef: { fn?: (phase: "start" | "end") => void } = {};
+
       // Ollama native API: bypass SDK's streamSimple and use direct /api/chat calls
       // for reliable streaming + tool calling support (#11828).
       if (params.model.api === "ollama") {
@@ -773,6 +776,7 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = createAnthropicAgentSDKStreamFn({
           onToolResult: params.onToolResult,
           hasSteeringMessages: () => activeSession.agent.hasQueuedMessages(),
+          onCompaction: (phase) => sdkCompactionRef.fn?.(phase),
         });
       } else {
         // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
@@ -990,6 +994,21 @@ export async function runEmbeddedAttempt(
         getUsageTotals,
         getCompactionCount,
       } = subscription;
+
+      // Wire up SDK compaction callback now that subscription exists.
+      // The subscription's compactionCount is internal, so we track SDK
+      // compactions via a local counter that merges into the subscription's
+      // getCompactionCount by overriding it.
+      if (params.model.api === "anthropic-agent-sdk") {
+        let sdkCompactions = 0;
+        const origGetCompactionCount = subscription.getCompactionCount;
+        subscription.getCompactionCount = () => origGetCompactionCount() + sdkCompactions;
+        sdkCompactionRef.fn = (phase: "start" | "end") => {
+          if (phase === "end") {
+            sdkCompactions += 1;
+          }
+        };
+      }
 
       const queueHandle: EmbeddedPiQueueHandle = {
         queueMessage: async (text: string) => {

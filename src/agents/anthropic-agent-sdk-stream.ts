@@ -68,23 +68,103 @@ function formatConversationForSDK(messages: Array<{ role: string; content: unkno
   return lastUserText || "Hello";
 }
 
-/**
- * Build a pi-ai AssistantMessage from the SDK result text.
- */
+// ── SDK usage extraction ────────────────────────────────────────────────────
+
+/** Shape of the SDK's NonNullableUsage / BetaUsage on result events. */
+type SDKUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+};
+
+/** Shape of SDK's per-model ModelUsage on result events. */
+type SDKModelUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  costUSD?: number;
+  contextWindow?: number;
+};
+
+/** Accumulated usage across all SDK events in a single query. */
+interface UsageAccumulator {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  costUsd: number;
+  contextWindow: number | undefined;
+}
+
+function createUsageAccumulator(): UsageAccumulator {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, contextWindow: undefined };
+}
+
+/** Extract usage from an SDKAssistantMessage's BetaMessage.usage (per-turn). */
+function accumulateAssistantUsage(acc: UsageAccumulator, messageUsage: SDKUsage | undefined): void {
+  if (!messageUsage) {
+    return;
+  }
+  acc.input += messageUsage.input_tokens ?? 0;
+  acc.output += messageUsage.output_tokens ?? 0;
+  acc.cacheRead += messageUsage.cache_read_input_tokens ?? 0;
+  acc.cacheWrite += messageUsage.cache_creation_input_tokens ?? 0;
+}
+
+/** Extract final usage from SDKResultSuccess/SDKResultError (session totals). */
+function extractResultUsage(
+  acc: UsageAccumulator,
+  evt: { usage?: SDKUsage; modelUsage?: Record<string, SDKModelUsage>; total_cost_usd?: number },
+): void {
+  // Result event carries session-total usage — replace accumulated per-turn values.
+  if (evt.usage) {
+    acc.input = evt.usage.input_tokens ?? acc.input;
+    acc.output = evt.usage.output_tokens ?? acc.output;
+    acc.cacheRead = evt.usage.cache_read_input_tokens ?? acc.cacheRead;
+    acc.cacheWrite = evt.usage.cache_creation_input_tokens ?? acc.cacheWrite;
+  }
+  if (typeof evt.total_cost_usd === "number") {
+    acc.costUsd = evt.total_cost_usd;
+  }
+  // Extract contextWindow from per-model usage (take the first model's value).
+  if (evt.modelUsage) {
+    for (const mu of Object.values(evt.modelUsage)) {
+      if (typeof mu.contextWindow === "number" && mu.contextWindow > 0) {
+        acc.contextWindow = mu.contextWindow;
+        break;
+      }
+    }
+  }
+}
+
+function accumulatorToUsage(acc: UsageAccumulator): Usage {
+  const total = acc.input + acc.output;
+  return {
+    input: acc.input,
+    output: acc.output,
+    cacheRead: acc.cacheRead,
+    cacheWrite: acc.cacheWrite,
+    totalTokens: total,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: acc.costUsd,
+    },
+  };
+}
+
+// ── Message building ────────────────────────────────────────────────────────
+
 function buildAssistantMessageFromSDK(
   text: string,
   modelInfo: { api: string; provider: string; id: string },
   stopReason: StopReason = "stop",
+  usage?: Usage,
 ): AssistantMessage {
-  const usage: Usage = {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-
   return {
     role: "assistant",
     content: text ? [{ type: "text", text }] : [],
@@ -92,7 +172,14 @@ function buildAssistantMessageFromSDK(
     api: modelInfo.api,
     provider: modelInfo.provider,
     model: modelInfo.id,
-    usage,
+    usage: usage ?? {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
     timestamp: Date.now(),
   };
 }
@@ -108,6 +195,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
   onToolResult?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
   /** Check if steering messages are queued (new user message arrived mid-run). */
   hasSteeringMessages?: () => boolean;
+  /** Called when SDK reports compaction events. */
+  onCompaction?: (phase: "start" | "end") => void;
 }): StreamFn {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -198,6 +287,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         let resultText = "";
         let textBlockStarted = false;
         let gotFinalResult = false;
+        const usageAcc = createUsageAccumulator();
+        let isCompacting = false;
 
         // Partial message built up as deltas arrive
         const partial = buildAssistantMessageFromSDK("", modelInfo);
@@ -223,27 +314,67 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             sdkSessionId = evt.session_id;
           }
 
-          // SDKResultSuccess event contains the final response text
+          // SDKResultSuccess — final response text + session-total usage.
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
             gotFinalResult = true;
+            extractResultUsage(
+              usageAcc,
+              evt as {
+                usage?: SDKUsage;
+                modelUsage?: Record<string, SDKModelUsage>;
+                total_cost_usd?: number;
+              },
+            );
           }
+
+          // SDKResultError — still carries usage data.
           if (evt.type === "result" && evt.subtype !== "success") {
-            // SDKResultError subtypes: error_during_execution | error_max_turns |
-            // error_max_budget_usd | error_max_structured_output_retries
             const errEvt = evt as {
               subtype?: string;
               errors?: string[];
               num_turns?: number;
               stop_reason?: string | null;
+              usage?: SDKUsage;
+              modelUsage?: Record<string, SDKModelUsage>;
+              total_cost_usd?: number;
             };
+            extractResultUsage(usageAcc, errEvt);
             const errMsg = `Agent SDK result error: subtype=${errEvt.subtype} turns=${errEvt.num_turns} stop_reason=${errEvt.stop_reason} errors=${(errEvt.errors ?? []).join("; ")}`;
             log.error(errMsg);
             throw new Error(errMsg);
           }
 
-          // SDKPartialAssistantMessage: { type: 'stream_event', event: BetaRawMessageStreamEvent }
-          // Extract text deltas from content_block_delta events.
+          // SDKAssistantMessage — per-turn usage from the full BetaMessage.
+          if (evt.type === "assistant") {
+            const msg = (evt as { message?: { usage?: SDKUsage } }).message;
+            accumulateAssistantUsage(usageAcc, msg?.usage);
+          }
+
+          // SDKStatusMessage — compaction status changes.
+          if (evt.type === "system" && evt.subtype === "status") {
+            const status = (evt as { status?: string | null }).status;
+            if (status === "compacting" && !isCompacting) {
+              isCompacting = true;
+              opts?.onCompaction?.("start");
+              log.info("Agent SDK: compaction started");
+            } else if (status !== "compacting" && isCompacting) {
+              isCompacting = false;
+              opts?.onCompaction?.("end");
+              log.info("Agent SDK: compaction ended");
+            }
+          }
+
+          // SDKCompactBoundaryMessage — explicit compaction boundary.
+          if (evt.type === "system" && evt.subtype === "compact_boundary") {
+            const meta = (evt as { compact_metadata?: { pre_tokens?: number; trigger?: string } })
+              .compact_metadata;
+            log.info(
+              `Agent SDK: compact boundary trigger=${meta?.trigger} pre_tokens=${meta?.pre_tokens}`,
+            );
+          }
+
+          // SDKPartialAssistantMessage — extract text deltas for live streaming.
           if (evt.type === "stream_event" && !gotFinalResult) {
             const streamEvt = (evt as { event?: Record<string, unknown> }).event;
             if (
@@ -279,9 +410,10 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           log.info(`Agent SDK: saved session ${sdkSessionId} for resume`);
         }
 
+        const finalUsage = accumulatorToUsage(usageAcc);
         const stopReason: StopReason = wasAborted ? ("aborted" as StopReason) : "stop";
         const finalText = isSilentReplyText(resultText.trim()) ? "" : resultText.trim();
-        const message = buildAssistantMessageFromSDK(finalText, modelInfo, stopReason);
+        const message = buildAssistantMessageFromSDK(finalText, modelInfo, stopReason, finalUsage);
 
         if (textBlockStarted) {
           stream.push({
@@ -293,7 +425,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         }
 
         log.info(
-          `Agent SDK result: model=${model.id} text_len=${resultText.length} aborted=${wasAborted} interrupted=${wasInterrupted}`,
+          `Agent SDK result: model=${model.id} text_len=${resultText.length} tokens=${finalUsage.input}in/${finalUsage.output}out cache=${finalUsage.cacheRead}r/${finalUsage.cacheWrite}w cost=$${usageAcc.costUsd.toFixed(4)} aborted=${wasAborted} interrupted=${wasInterrupted}`,
         );
 
         if (wasAborted) {
