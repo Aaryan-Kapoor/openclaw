@@ -259,6 +259,17 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           `Agent SDK call: model=${model.id} prompt_len=${prompt.length} system_len=${(context.systemPrompt ?? "").length} resume=${resumeId ?? "none"}`,
         );
 
+        // Map pi-agent-core thinking level to SDK effort level.
+        const reasoning = (options as { reasoning?: string } | undefined)?.reasoning;
+        const effortMap: Record<string, "low" | "medium" | "high" | "max"> = {
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "max",
+        };
+        const effort = reasoning ? effortMap[reasoning] : undefined;
+
         sdkStream = queryFn({
           prompt,
           options: {
@@ -274,6 +285,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
             permissionMode: "bypassPermissions",
             allowDangerouslySkipPermissions: true,
             includePartialMessages: true,
+            // Map thinking level from /think command to SDK effort parameter.
+            ...(effort ? { effort } : {}),
             // Resume a previously interrupted session if available.
             ...(resumeId ? { resume: resumeId } : {}),
           },
