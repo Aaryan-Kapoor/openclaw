@@ -88,71 +88,87 @@ type SDKModelUsage = {
   contextWindow?: number;
 };
 
-/** Accumulated usage across all SDK events in a single query. */
-interface UsageAccumulator {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
+/**
+ * Usage tracker for SDK streams.
+ *
+ * Pi-agent-core uses AssistantMessage.usage to track context fill and trigger
+ * compaction. The SDK's result event carries SESSION-TOTAL usage (all API calls
+ * across all turns summed), which is far larger than the actual context window
+ * fill. Feeding session totals into the message usage causes false compactions.
+ *
+ * Instead, we track two things separately:
+ * - lastTurnUsage: the most recent SDKAssistantMessage's per-turn token counts.
+ *   This represents the actual current context window fill (input_tokens = prompt
+ *   size sent to the API on the last turn). This drives context tracking.
+ * - costUsd / contextWindow: from the result event, for display only.
+ */
+interface UsageTracker {
+  /** Last assistant turn's usage — represents current context fill. */
+  lastInput: number;
+  lastOutput: number;
+  lastCacheRead: number;
+  lastCacheWrite: number;
+  /** Session-level cost from result event. */
   costUsd: number;
+  /** Context window size from modelUsage. */
   contextWindow: number | undefined;
 }
 
-function createUsageAccumulator(): UsageAccumulator {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, contextWindow: undefined };
+function createUsageTracker(): UsageTracker {
+  return {
+    lastInput: 0,
+    lastOutput: 0,
+    lastCacheRead: 0,
+    lastCacheWrite: 0,
+    costUsd: 0,
+    contextWindow: undefined,
+  };
 }
 
-/** Extract usage from an SDKAssistantMessage's BetaMessage.usage (per-turn). */
-function accumulateAssistantUsage(acc: UsageAccumulator, messageUsage: SDKUsage | undefined): void {
+/** Update with per-turn usage from SDKAssistantMessage (replaces, not accumulates). */
+function updateLastTurnUsage(tracker: UsageTracker, messageUsage: SDKUsage | undefined): void {
   if (!messageUsage) {
     return;
   }
-  acc.input += messageUsage.input_tokens ?? 0;
-  acc.output += messageUsage.output_tokens ?? 0;
-  acc.cacheRead += messageUsage.cache_read_input_tokens ?? 0;
-  acc.cacheWrite += messageUsage.cache_creation_input_tokens ?? 0;
+  // Each SDKAssistantMessage carries that turn's usage — use the latest one.
+  tracker.lastInput = messageUsage.input_tokens ?? 0;
+  tracker.lastOutput = messageUsage.output_tokens ?? 0;
+  tracker.lastCacheRead = messageUsage.cache_read_input_tokens ?? 0;
+  tracker.lastCacheWrite = messageUsage.cache_creation_input_tokens ?? 0;
 }
 
-/** Extract final usage from SDKResultSuccess/SDKResultError (session totals). */
-function extractResultUsage(
-  acc: UsageAccumulator,
+/** Extract cost and contextWindow from SDKResultSuccess/SDKResultError. */
+function extractResultMeta(
+  tracker: UsageTracker,
   evt: { usage?: SDKUsage; modelUsage?: Record<string, SDKModelUsage>; total_cost_usd?: number },
 ): void {
-  // Result event carries session-total usage — replace accumulated per-turn values.
-  if (evt.usage) {
-    acc.input = evt.usage.input_tokens ?? acc.input;
-    acc.output = evt.usage.output_tokens ?? acc.output;
-    acc.cacheRead = evt.usage.cache_read_input_tokens ?? acc.cacheRead;
-    acc.cacheWrite = evt.usage.cache_creation_input_tokens ?? acc.cacheWrite;
-  }
   if (typeof evt.total_cost_usd === "number") {
-    acc.costUsd = evt.total_cost_usd;
+    tracker.costUsd = evt.total_cost_usd;
   }
-  // Extract contextWindow from per-model usage (take the first model's value).
   if (evt.modelUsage) {
     for (const mu of Object.values(evt.modelUsage)) {
       if (typeof mu.contextWindow === "number" && mu.contextWindow > 0) {
-        acc.contextWindow = mu.contextWindow;
+        tracker.contextWindow = mu.contextWindow;
         break;
       }
     }
   }
 }
 
-function accumulatorToUsage(acc: UsageAccumulator): Usage {
-  const total = acc.input + acc.output;
+function trackerToUsage(tracker: UsageTracker): Usage {
+  const total = tracker.lastInput + tracker.lastOutput;
   return {
-    input: acc.input,
-    output: acc.output,
-    cacheRead: acc.cacheRead,
-    cacheWrite: acc.cacheWrite,
+    input: tracker.lastInput,
+    output: tracker.lastOutput,
+    cacheRead: tracker.lastCacheRead,
+    cacheWrite: tracker.lastCacheWrite,
     totalTokens: total,
     cost: {
       input: 0,
       output: 0,
       cacheRead: 0,
       cacheWrite: 0,
-      total: acc.costUsd,
+      total: tracker.costUsd,
     },
   };
 }
@@ -287,7 +303,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         let resultText = "";
         let textBlockStarted = false;
         let gotFinalResult = false;
-        const usageAcc = createUsageAccumulator();
+        const usageTracker = createUsageTracker();
         let isCompacting = false;
 
         // Partial message built up as deltas arrive
@@ -318,8 +334,8 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           if (evt.type === "result" && evt.subtype === "success") {
             resultText = (evt as { result?: string }).result ?? "";
             gotFinalResult = true;
-            extractResultUsage(
-              usageAcc,
+            extractResultMeta(
+              usageTracker,
               evt as {
                 usage?: SDKUsage;
                 modelUsage?: Record<string, SDKModelUsage>;
@@ -339,7 +355,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
               modelUsage?: Record<string, SDKModelUsage>;
               total_cost_usd?: number;
             };
-            extractResultUsage(usageAcc, errEvt);
+            extractResultMeta(usageTracker, errEvt);
             const errMsg = `Agent SDK result error: subtype=${errEvt.subtype} turns=${errEvt.num_turns} stop_reason=${errEvt.stop_reason} errors=${(errEvt.errors ?? []).join("; ")}`;
             log.error(errMsg);
             throw new Error(errMsg);
@@ -348,7 +364,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           // SDKAssistantMessage — per-turn usage from the full BetaMessage.
           if (evt.type === "assistant") {
             const msg = (evt as { message?: { usage?: SDKUsage } }).message;
-            accumulateAssistantUsage(usageAcc, msg?.usage);
+            updateLastTurnUsage(usageTracker, msg?.usage);
           }
 
           // SDKStatusMessage — compaction status changes.
@@ -410,7 +426,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           log.info(`Agent SDK: saved session ${sdkSessionId} for resume`);
         }
 
-        const finalUsage = accumulatorToUsage(usageAcc);
+        const finalUsage = trackerToUsage(usageTracker);
         const stopReason: StopReason = wasAborted ? ("aborted" as StopReason) : "stop";
         const finalText = isSilentReplyText(resultText.trim()) ? "" : resultText.trim();
         const message = buildAssistantMessageFromSDK(finalText, modelInfo, stopReason, finalUsage);
@@ -425,7 +441,7 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
         }
 
         log.info(
-          `Agent SDK result: model=${model.id} text_len=${resultText.length} tokens=${finalUsage.input}in/${finalUsage.output}out cache=${finalUsage.cacheRead}r/${finalUsage.cacheWrite}w cost=$${usageAcc.costUsd.toFixed(4)} aborted=${wasAborted} interrupted=${wasInterrupted}`,
+          `Agent SDK result: model=${model.id} text_len=${resultText.length} last_turn=${finalUsage.input}in/${finalUsage.output}out cache=${finalUsage.cacheRead}r/${finalUsage.cacheWrite}w cost=$${usageTracker.costUsd.toFixed(4)} aborted=${wasAborted} interrupted=${wasInterrupted}`,
         );
 
         if (wasAborted) {
