@@ -156,9 +156,13 @@ function extractResultMeta(
 }
 
 function trackerToUsage(tracker: UsageTracker): Usage {
-  const total = tracker.lastInput + tracker.lastOutput;
+  // Anthropic's usage breakdown: input_tokens is the uncached portion,
+  // cache_read is served from cache, cache_write is newly cached.
+  // Full prompt size = input + cacheRead + cacheWrite.
+  const fullInput = tracker.lastInput + tracker.lastCacheRead + tracker.lastCacheWrite;
+  const total = fullInput + tracker.lastOutput;
   return {
-    input: tracker.lastInput,
+    input: fullInput,
     output: tracker.lastOutput,
     cacheRead: tracker.lastCacheRead,
     cacheWrite: tracker.lastCacheWrite,
