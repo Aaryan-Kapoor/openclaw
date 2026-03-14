@@ -264,9 +264,10 @@ export function createAnthropicAgentSDKStreamFn(opts?: {
           options: {
             model: model.id,
             systemPrompt: context.systemPrompt || undefined,
-            // Disable all built-in Claude Code tools (Bash, Read, Edit, etc.) — only
-            // MCP-bridged OpenClaw tools are available via mcpServers below.
-            tools: [] as const,
+            // Enable Claude Code's built-in WebFetch and WebSearch (free, no API key).
+            // All other built-in tools disabled — the agent uses MCP-bridged
+            // OpenClaw tools via mcpServers below instead.
+            tools: ["WebFetch", "WebSearch"],
             mcpServers: mcpServers as Record<string, never>,
             // maxTurns omitted — unlimited turns, matching pi-agent-core behavior
             // for all other providers (OpenAI, Google, etc.).

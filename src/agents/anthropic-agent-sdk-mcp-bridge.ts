@@ -101,12 +101,18 @@ type OnToolResultFn = (payload: { text?: string; mediaUrls?: string[] }) => void
  * @param tools - OpenClaw AgentTool instances
  * @param sdk - The dynamically-imported @anthropic-ai/claude-agent-sdk module
  */
+/** OpenClaw tools to exclude when Claude Code built-in equivalents are enabled. */
+const EXCLUDED_TOOLS = new Set(["web_search", "web_fetch"]);
+
 export function createOpenClawMcpServer(
   tools: AgentTool[],
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK is dynamically imported
   sdk: Record<string, any>,
   onToolResult?: OnToolResultFn,
 ): unknown {
+  // Filter out tools that have free built-in equivalents in the SDK subprocess.
+  tools = tools.filter((t) => !EXCLUDED_TOOLS.has(t.name));
+
   const createSdkMcpServer = sdk.createSdkMcpServer as (options: {
     name: string;
     tools: unknown[];
