@@ -461,6 +461,41 @@ describe("compaction-safeguard double-compaction guard", () => {
     expect(getApiKeyMock).not.toHaveBeenCalled();
   });
 
+  it("continues when turnPrefixMessages has real messages (split-turn)", async () => {
+    const sessionManager = stubSessionManager();
+    const model = createAnthropicModelFixture();
+    setCompactionSafeguardRuntime(sessionManager, { model });
+
+    const compactionHandler = createCompactionHandler();
+    const mockEvent = {
+      preparation: {
+        messagesToSummarize: [] as AgentMessage[],
+        turnPrefixMessages: [
+          { role: "user", content: "split turn message", timestamp: Date.now() },
+        ] as AgentMessage[],
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 1500,
+        fileOps: { read: [], edited: [], written: [] },
+      },
+      customInstructions: "",
+      signal: new AbortController().signal,
+    };
+
+    const getApiKeyMock = vi.fn().mockResolvedValue(null);
+    const mockContext = createCompactionContext({
+      sessionManager,
+      getApiKeyMock,
+    });
+
+    const result = (await compactionHandler(mockEvent, mockContext)) as {
+      cancel?: boolean;
+    };
+    // Should NOT cancel early — it should proceed past the safeguard and reach getApiKey
+    expect(getApiKeyMock).toHaveBeenCalled();
+    // Cancels here because getApiKey returns null, not because of the safeguard
+    expect(result).toEqual({ cancel: true });
+  });
+
   it("continues when messages include real conversation content", async () => {
     const sessionManager = stubSessionManager();
     const model = createAnthropicModelFixture();
